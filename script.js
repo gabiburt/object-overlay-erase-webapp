@@ -519,60 +519,71 @@ bgInput.addEventListener('change', (e) => {
   img.src = URL.createObjectURL(file);
 });
 
-// Event: load overlay
+// Event: load overlay(s)
 overlayInput.addEventListener('change', (e) => {
-  const file = e.target.files[0];
-  // Only allow adding an overlay if a background exists
-  if (!file || !bgImg) return;
-  const rawImg = new Image();
-  rawImg.onload = () => {
-    // Apply grey key to convert to RGBA with transparency
-    applyGreyKey(rawImg, (rgbaImg) => {
-      // Compute initial scale to fit the overlay within the background
-      const maxW = bgImg.width;
-      const maxH = bgImg.height;
-      const ovW = rgbaImg.width;
-      const ovH = rgbaImg.height;
-      const scaleX = maxW / ovW;
-      const scaleY = maxH / ovH;
-      const maxScale = Math.min(scaleX, scaleY, 1);
-      // Construct a new overlay object
-      const ov = {
-        img: rgbaImg,
-        originalImg: rgbaImg,
-        state: {
-          x: Math.min(20, maxW - ovW * maxScale),
-          y: Math.min(20, maxH - ovH * maxScale),
-          scale: maxScale,
-          angle: 0,
-          flipH: false,
-          flipV: false,
-        },
-        cropMode: false,
-        cropping: false,
-        cropStart: null,
-        cropEnd: null,
-      };
-      overlays.push(ov);
-      activeOverlayIndex = overlays.length - 1;
-      // Bring the newly added overlay to the top of the stacking order (already last)
-      updateActiveOverlayRefs();
-      // Enable controls now that at least one overlay exists
-      controls.style.display = 'flex';
-      saveBtn.disabled = false;
-      removeOverlayBtn.disabled = false;
-      angleInput.value = 0;
-      // Enable crop functionality
-      cropBtn.disabled = false;
-      cropBtn.textContent = 'Crop';
-      // Reset undo/redo stacks and save the initial state for undo
-      undoStack.length = 0;
-      redoStack.length = 0;
-      saveState();
-      drawScene();
-    });
-  };
-  rawImg.src = URL.createObjectURL(file);
+  const files = Array.from(e.target.files);
+  // Only allow adding overlays if a background exists
+  if (files.length === 0 || !bgImg) return;
+  // Determine whether this is the first overlay being added
+  const isFirstOverlay = overlays.length === 0;
+  // If not the first overlay, save current state so the addition can be undone
+  if (!isFirstOverlay) {
+    saveState();
+  } else {
+    // For the first overlay, clear undo/redo stacks before saving initial state
+    undoStack.length = 0;
+    redoStack.length = 0;
+  }
+  let filesProcessed = 0;
+  files.forEach((file) => {
+    const rawImg = new Image();
+    rawImg.onload = () => {
+      applyGreyKey(rawImg, (rgbaImg) => {
+        const maxW = bgImg.width;
+        const maxH = bgImg.height;
+        const ovW = rgbaImg.width;
+        const ovH = rgbaImg.height;
+        const scaleX = maxW / ovW;
+        const scaleY = maxH / ovH;
+        const maxScale = Math.min(scaleX, scaleY, 1);
+        // Construct a new overlay object with default state
+        const ov = {
+          img: rgbaImg,
+          originalImg: rgbaImg,
+          state: {
+            x: Math.min(20, maxW - ovW * maxScale),
+            y: Math.min(20, maxH - ovH * maxScale),
+            scale: maxScale,
+            angle: 0,
+            flipH: false,
+            flipV: false,
+          },
+          cropMode: false,
+          cropping: false,
+          cropStart: null,
+          cropEnd: null,
+        };
+        overlays.push(ov);
+        activeOverlayIndex = overlays.length - 1;
+        // Set active overlay references to the newly added overlay
+        updateActiveOverlayRefs();
+        filesProcessed++;
+        // Once all selected files are processed, update UI and save state
+        if (filesProcessed === files.length) {
+          controls.style.display = 'flex';
+          saveBtn.disabled = false;
+          removeOverlayBtn.disabled = false;
+          angleInput.value = 0;
+          cropBtn.disabled = false;
+          cropBtn.textContent = 'Crop';
+          // Save the new state so addition can be undone
+          saveState();
+          drawScene();
+        }
+      });
+    };
+    rawImg.src = URL.createObjectURL(file);
+  });
   // Reset input value to allow uploading the same file again
   overlayInput.value = '';
 });

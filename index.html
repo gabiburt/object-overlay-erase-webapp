@@ -106,7 +106,8 @@
       </label>
       <label>
         Load Overlay
-        <input type="file" id="overlay-input" accept="image/*" />
+        <!-- Allow selecting multiple overlay files at once -->
+        <input type="file" id="overlay-input" accept="image/*" multiple />
       </label>
       <button id="remove-overlay" disabled>Remove Overlay</button>
       <button id="set-output" disabled>Set Output Dir</button>
