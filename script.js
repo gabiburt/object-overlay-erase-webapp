@@ -6,8 +6,16 @@
 
 /* Global state */
 let bgImg = null;              // HTMLImageElement for background
-let overlayImg = null;         // HTMLImageElement for keyed overlay
-let overlayOriginalImg = null; // Original keyed overlay (untransformed)
+// Support multiple overlays. Each overlay is an object with
+// {img, originalImg, state, cropMode, cropping, cropStart, cropEnd}
+let overlays = [];
+// Index of the currently active overlay in the overlays array. -1 if none.
+let activeOverlayIndex = -1;
+// References for the active overlay. These will point at the currently
+// selected overlay's image and state. They are updated whenever the
+// active overlay changes.
+let overlayImg = null;
+let overlayOriginalImg = null;
 let overlayState = {
   x: 0,
   y: 0,
@@ -16,6 +24,74 @@ let overlayState = {
   flipH: false,
   flipV: false,
 };
+/**
+ * Update global overlayImg, overlayOriginalImg and overlayState to point
+ * to the currently active overlay. If there is no active overlay these
+ * references are cleared and a default state is used.
+ */
+function updateActiveOverlayRefs() {
+  if (activeOverlayIndex < 0 || activeOverlayIndex >= overlays.length) {
+    overlayImg = null;
+    overlayOriginalImg = null;
+    // Reset overlayState to a default object so that UI bindings remain valid.
+    overlayState = { x: 0, y: 0, scale: 1, angle: 0, flipH: false, flipV: false };
+    return;
+  }
+  const ov = overlays[activeOverlayIndex];
+  overlayImg = ov.img;
+  overlayOriginalImg = ov.originalImg;
+  overlayState = ov.state;
+}
+
+/**
+ * Restore the overlays array from serialized data and set the active overlay.
+ * @param {Array} overlaysData Array of serialized overlay data (objects with imgData, originalData, state, cropMode, etc.).
+ * @param {number} activeIdx Index of the overlay to set active.
+ * @returns {Promise<void>} Resolves when all images are loaded and references updated.
+ */
+function restoreOverlaysFromData(overlaysData, activeIdx) {
+  overlays = [];
+  activeOverlayIndex = -1;
+  if (!overlaysData || overlaysData.length === 0) {
+    updateActiveOverlayRefs();
+    return Promise.resolve();
+  }
+  const loadPromises = [];
+  overlaysData.forEach((data, index) => {
+    const ov = {
+      img: null,
+      originalImg: null,
+      state: { ...data.state },
+      cropMode: data.cropMode || false,
+      cropping: data.cropping || false,
+      cropStart: data.cropStart ? { ...data.cropStart } : null,
+      cropEnd: data.cropEnd ? { ...data.cropEnd } : null,
+    };
+    overlays.push(ov);
+    if (data.imgData) {
+      const p = new Promise((resolve) => {
+        const im = new Image();
+        im.onload = () => {
+          ov.img = im;
+          // original keyed overlay is identical to keyed overlay in this app
+          ov.originalImg = im;
+          resolve();
+        };
+        im.src = data.imgData;
+      });
+      loadPromises.push(p);
+    }
+  });
+  return Promise.all(loadPromises).then(() => {
+    // Set active overlay index
+    if (typeof activeIdx === 'number' && activeIdx >= 0 && activeIdx < overlays.length) {
+      activeOverlayIndex = activeIdx;
+    } else {
+      activeOverlayIndex = overlays.length - 1;
+    }
+    updateActiveOverlayRefs();
+  });
+}
 let dragging = false;
 let dragData = { localX: 0, localY: 0 };
 // When true, the user is resizing the overlay via a corner handle
@@ -46,16 +122,8 @@ const outputPrefixInput = document.getElementById('output-prefix');
 const saveBtn = document.getElementById('save');
 const newBtn = document.getElementById('new-session');
 const outputStatus = document.getElementById('output-status');
-// Crop button and cropping state variables
+// Crop button. Cropping state is stored per overlay inside the overlays array.
 const cropBtn = document.getElementById('crop');
-// Indicates whether user has toggled crop mode
-let cropMode = false;
-// True while pointer drag defines the crop rectangle
-let cropping = false;
-// Starting corner of crop rectangle in unscaled overlay local coordinates
-let cropStart = null;
-// Ending corner of crop rectangle in unscaled overlay local coordinates
-let cropEnd = null;
 
 // Erase button and erasing state variables
 const eraseBtn = document.getElementById('erase');
@@ -83,12 +151,22 @@ const redoStack = [];
 function saveState() {
   // Only record a state when a background image exists
   if (!bgImg) return;
-  const stateCopy = { ...overlayState };
-  // Store overlay and original images if present, otherwise null
-  const overlayData = overlayImg ? overlayImg.src : null;
-  const originalData = overlayOriginalImg ? overlayOriginalImg.src : null;
+  // Deep copy all overlay state. Each overlay stores its image data URL and its
+  // transformation state so we can fully restore it during undo/redo.
+  const overlaysData = overlays.map((o) => {
+    return {
+      imgData: o.img ? o.img.src : null,
+      originalData: o.originalImg ? o.originalImg.src : null,
+      state: { ...o.state },
+      cropMode: o.cropMode || false,
+      cropping: o.cropping || false,
+      cropStart: o.cropStart ? { ...o.cropStart } : null,
+      cropEnd: o.cropEnd ? { ...o.cropEnd } : null,
+    };
+  });
   const bgData = bgImg ? bgImg.src : null;
-  undoStack.push({ overlayData, originalData, bgData, state: stateCopy });
+  const activeIndex = activeOverlayIndex;
+  undoStack.push({ overlaysData, bgData, activeIndex });
   // Whenever we push a new state, clear the redo history
   redoStack.length = 0;
   updateUndoRedoButtons();
@@ -99,55 +177,38 @@ function saveState() {
 // function does nothing.
 function undo() {
   if (undoStack.length === 0) return;
-  // Push the current state onto the redo stack, capturing overlay and background data
-  const current = {
-    overlayData: overlayImg ? overlayImg.src : null,
-    originalData: overlayOriginalImg ? overlayOriginalImg.src : null,
-    bgData: bgImg ? bgImg.src : null,
-    state: { ...overlayState },
-  };
-  redoStack.push(current);
+  // Push current state onto redo stack. Serialize the overlays and background.
+  if (bgImg) {
+    const overlaysData = overlays.map((o) => ({
+      imgData: o.img ? o.img.src : null,
+      originalData: o.originalImg ? o.originalImg.src : null,
+      state: { ...o.state },
+      cropMode: o.cropMode || false,
+      cropping: o.cropping || false,
+      cropStart: o.cropStart ? { ...o.cropStart } : null,
+      cropEnd: o.cropEnd ? { ...o.cropEnd } : null,
+    }));
+    redoStack.push({ overlaysData, bgData: bgImg.src, activeIndex: activeOverlayIndex });
+  }
   const prev = undoStack.pop();
-  // Restore previous overlay
-  if (prev && prev.overlayData) {
-    const img = new Image();
-    img.onload = () => {
-      overlayImg = img;
-      overlayOriginalImg = img;
-      overlayState = { ...prev.state };
-      // After overlay loads, restore background if available
-      if (prev.bgData) {
-        const bimg = new Image();
-        bimg.onload = () => {
-          bgImg = bimg;
-          drawScene();
-          updateUndoRedoButtons();
-        };
-        bimg.src = prev.bgData;
-      } else {
-        drawScene();
-        updateUndoRedoButtons();
-      }
-    };
-    img.src = prev.overlayData;
-  } else {
-    // Remove overlay if none recorded
-    overlayImg = null;
-    overlayOriginalImg = null;
-    // Restore background if available
-    if (prev && prev.bgData) {
+  if (!prev) return;
+  // Restore overlays and background from previous state
+  const { overlaysData, bgData, activeIndex } = prev;
+  // Restore overlays (async) then restore background
+  restoreOverlaysFromData(overlaysData, activeIndex).then(() => {
+    if (bgData) {
       const bimg = new Image();
       bimg.onload = () => {
         bgImg = bimg;
         drawScene();
         updateUndoRedoButtons();
       };
-      bimg.src = prev.bgData;
+      bimg.src = bgData;
     } else {
       drawScene();
       updateUndoRedoButtons();
     }
-  }
+  });
 }
 
 // Reapply the most recently undone state from the redo stack. The current
@@ -155,56 +216,36 @@ function undo() {
 // available the function does nothing.
 function redo() {
   if (redoStack.length === 0) return;
-  // Push the current state onto the undo stack
-  const current = {
-    overlayData: overlayImg ? overlayImg.src : null,
-    originalData: overlayOriginalImg ? overlayOriginalImg.src : null,
-    bgData: bgImg ? bgImg.src : null,
-    state: { ...overlayState },
-  };
-  undoStack.push(current);
+  // Push current state onto undo stack
+  if (bgImg) {
+    const overlaysData = overlays.map((o) => ({
+      imgData: o.img ? o.img.src : null,
+      originalData: o.originalImg ? o.originalImg.src : null,
+      state: { ...o.state },
+      cropMode: o.cropMode || false,
+      cropping: o.cropping || false,
+      cropStart: o.cropStart ? { ...o.cropStart } : null,
+      cropEnd: o.cropEnd ? { ...o.cropEnd } : null,
+    }));
+    undoStack.push({ overlaysData, bgData: bgImg.src, activeIndex: activeOverlayIndex });
+  }
   const next = redoStack.pop();
   if (!next) return;
-  // Restore overlay
-  if (next.overlayData) {
-    const img = new Image();
-    img.onload = () => {
-      overlayImg = img;
-      overlayOriginalImg = img;
-      overlayState = { ...next.state };
-      // After overlay loads, restore background if available
-      if (next.bgData) {
-        const bimg = new Image();
-        bimg.onload = () => {
-          bgImg = bimg;
-          drawScene();
-          updateUndoRedoButtons();
-        };
-        bimg.src = next.bgData;
-      } else {
-        drawScene();
-        updateUndoRedoButtons();
-      }
-    };
-    img.src = next.overlayData;
-  } else {
-    // No overlay; clear
-    overlayImg = null;
-    overlayOriginalImg = null;
-    // Restore background if available
-    if (next.bgData) {
+  const { overlaysData, bgData, activeIndex } = next;
+  restoreOverlaysFromData(overlaysData, activeIndex).then(() => {
+    if (bgData) {
       const bimg = new Image();
       bimg.onload = () => {
         bgImg = bimg;
         drawScene();
         updateUndoRedoButtons();
       };
-      bimg.src = next.bgData;
+      bimg.src = bgData;
     } else {
       drawScene();
       updateUndoRedoButtons();
     }
-  }
+  });
 }
 
 // Enable or disable undo and redo buttons based on stack sizes.
@@ -240,23 +281,24 @@ document.addEventListener('keydown', (e) => {
 // Crop button toggles crop mode on and off. When entering crop mode the user can drag
 // a rectangle on the overlay to crop the image. Clicking again cancels crop mode.
 cropBtn.addEventListener('click', () => {
-  // Crop button only works when an overlay image is loaded
-  if (!overlayImg) return;
-  if (!cropMode) {
+  // Crop button only works when an overlay is loaded and selected
+  if (!overlayImg || activeOverlayIndex < 0) return;
+  const ov = overlays[activeOverlayIndex];
+  if (!ov.cropMode) {
     // Save current state before entering crop mode for undo
     saveState();
-    // Enter crop mode: reset any previous selection
-    cropMode = true;
-    cropping = false;
-    cropStart = null;
-    cropEnd = null;
+    // Enter crop mode for this overlay
+    ov.cropMode = true;
+    ov.cropping = false;
+    ov.cropStart = null;
+    ov.cropEnd = null;
     cropBtn.textContent = 'Cancel Crop';
   } else {
     // Exit crop mode without applying crop
-    cropMode = false;
-    cropping = false;
-    cropStart = null;
-    cropEnd = null;
+    ov.cropMode = false;
+    ov.cropping = false;
+    ov.cropStart = null;
+    ov.cropEnd = null;
     cropBtn.textContent = 'Crop';
     drawScene();
   }
@@ -300,82 +342,80 @@ function drawScene() {
   // Draw background
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   ctx.drawImage(bgImg, 0, 0);
-  // Draw overlay if present
-  if (overlayImg) {
-    const w = overlayImg.width * overlayState.scale;
-    const h = overlayImg.height * overlayState.scale;
-    const cx = overlayState.x + w / 2;
-    const cy = overlayState.y + h / 2;
-    ctx.save();
-    ctx.translate(cx, cy);
-    ctx.rotate((overlayState.angle * Math.PI) / 180);
-    // Flip via scaling negative axes
-    const sx = overlayState.flipH ? -1 : 1;
-    const sy = overlayState.flipV ? -1 : 1;
-    ctx.scale(sx, sy);
-    ctx.scale(overlayState.scale, overlayState.scale);
-    ctx.drawImage(
-      overlayImg,
-      -overlayImg.width / 2,
-      -overlayImg.height / 2
-    );
-    ctx.restore();
-
-    // Draw bounding box and resize handles for interactive resizing
-    ctx.save();
-    ctx.translate(cx, cy);
-    ctx.rotate((overlayState.angle * Math.PI) / 180);
-    // Outline
-    ctx.strokeStyle = 'rgba(0,0,0,0.5)';
-    ctx.lineWidth = 1;
-    ctx.strokeRect(-w / 2, -h / 2, w, h);
-    // Draw handles as small squares (constant size in screen pixels). We don't scale these with overlay scale.
-    const handleSize = 8;
-    const halfHandle = handleSize / 2;
-    const corners = [
-      { x: -w / 2, y: -h / 2 },
-      { x: w / 2, y: -h / 2 },
-      { x: w / 2, y: h / 2 },
-      { x: -w / 2, y: h / 2 }
-    ];
-    ctx.fillStyle = 'rgba(255,255,255,0.8)';
-    ctx.strokeStyle = 'rgba(0,0,0,0.7)';
-    ctx.lineWidth = 1;
-    for (const c of corners) {
-      // Draw handle rectangle
-      ctx.beginPath();
-      ctx.rect(c.x - halfHandle, c.y - halfHandle, handleSize, handleSize);
-      ctx.fill();
-      ctx.stroke();
-    }
-    // If cropping is active or in progress, draw the selection rectangle
-    if ((cropMode || cropping) && cropStart && cropEnd) {
-      // Determine rectangle in local unscaled coordinates
-      let sx = Math.min(cropStart.x, cropEnd.x);
-      let ex = Math.max(cropStart.x, cropEnd.x);
-      let sy = Math.min(cropStart.y, cropEnd.y);
-      let ey = Math.max(cropStart.y, cropEnd.y);
-      // Apply flips for display
-      const dispX1 = (overlayState.flipH ? -ex : sx) * overlayState.scale;
-      const dispX2 = (overlayState.flipH ? -sx : ex) * overlayState.scale;
-      const dispY1 = (overlayState.flipV ? -ey : sy) * overlayState.scale;
-      const dispY2 = (overlayState.flipV ? -sy : ey) * overlayState.scale;
-      const rectX = dispX1;
-      const rectY = dispY1;
-      const rectW = dispX2 - dispX1;
-      const rectH = dispY2 - dispY1;
+  // Draw overlays if any
+  if (overlays.length > 0) {
+    overlays.forEach((ov, idx) => {
+      if (!ov.img) return;
+      const w = ov.img.width * Math.abs(ov.state.scale);
+      const h = ov.img.height * Math.abs(ov.state.scale);
+      const cx = ov.state.x + w / 2;
+      const cy = ov.state.y + h / 2;
+      // Draw the overlay image with its transform
       ctx.save();
-      // Fill cropping rectangle with semi‑transparent white to highlight the selected area
-      ctx.fillStyle = 'rgba(255, 255, 255, 0.25)';
-      ctx.fillRect(rectX, rectY, rectW, rectH);
-      ctx.strokeStyle = 'rgba(255, 0, 0, 0.8)';
-      ctx.lineWidth = 1;
-      ctx.setLineDash([6, 4]);
-      ctx.strokeRect(rectX, rectY, rectW, rectH);
-      ctx.setLineDash([]);
+      ctx.translate(cx, cy);
+      ctx.rotate((ov.state.angle * Math.PI) / 180);
+      const sx = ov.state.flipH ? -1 : 1;
+      const sy = ov.state.flipV ? -1 : 1;
+      ctx.scale(sx, sy);
+      ctx.scale(ov.state.scale, ov.state.scale);
+      ctx.drawImage(ov.img, -ov.img.width / 2, -ov.img.height / 2);
       ctx.restore();
-    }
-    ctx.restore();
+      // If this is the active overlay, draw bounding box and handles
+      if (idx === activeOverlayIndex) {
+        ctx.save();
+        ctx.translate(cx, cy);
+        ctx.rotate((ov.state.angle * Math.PI) / 180);
+        // Outline
+        ctx.strokeStyle = 'rgba(0,0,0,0.5)';
+        ctx.lineWidth = 1;
+        ctx.strokeRect(-w / 2, -h / 2, w, h);
+        // Draw handles as small squares (constant size in screen pixels). We don't scale these with overlay scale.
+        const handleSize = 8;
+        const halfHandle = handleSize / 2;
+        const corners = [
+          { x: -w / 2, y: -h / 2 },
+          { x: w / 2, y: -h / 2 },
+          { x: w / 2, y: h / 2 },
+          { x: -w / 2, y: h / 2 },
+        ];
+        ctx.fillStyle = 'rgba(255,255,255,0.8)';
+        ctx.strokeStyle = 'rgba(0,0,0,0.7)';
+        ctx.lineWidth = 1;
+        corners.forEach((c) => {
+          ctx.beginPath();
+          ctx.rect(c.x - halfHandle, c.y - halfHandle, handleSize, handleSize);
+          ctx.fill();
+          ctx.stroke();
+        });
+        // If cropping is active or in progress for this overlay, draw the selection rectangle
+        if ((ov.cropMode || ov.cropping) && ov.cropStart && ov.cropEnd) {
+          // Determine rectangle in local unscaled coordinates
+          let sxU = Math.min(ov.cropStart.x, ov.cropEnd.x);
+          let exU = Math.max(ov.cropStart.x, ov.cropEnd.x);
+          let syU = Math.min(ov.cropStart.y, ov.cropEnd.y);
+          let eyU = Math.max(ov.cropStart.y, ov.cropEnd.y);
+          // Apply flips for display
+          const dispX1 = (ov.state.flipH ? -exU : sxU) * ov.state.scale;
+          const dispX2 = (ov.state.flipH ? -sxU : exU) * ov.state.scale;
+          const dispY1 = (ov.state.flipV ? -eyU : syU) * ov.state.scale;
+          const dispY2 = (ov.state.flipV ? -syU : eyU) * ov.state.scale;
+          const rectX = dispX1;
+          const rectY = dispY1;
+          const rectW = dispX2 - dispX1;
+          const rectH = dispY2 - dispY1;
+          ctx.save();
+          ctx.fillStyle = 'rgba(255, 255, 255, 0.25)';
+          ctx.fillRect(rectX, rectY, rectW, rectH);
+          ctx.strokeStyle = 'rgba(255, 0, 0, 0.8)';
+          ctx.lineWidth = 1;
+          ctx.setLineDash([6, 4]);
+          ctx.strokeRect(rectX, rectY, rectW, rectH);
+          ctx.setLineDash([]);
+          ctx.restore();
+        }
+        ctx.restore();
+      }
+    });
   }
   // Draw the erase selection rectangle on the background when erasing
   if ((eraseMode || erasing) && eraseStart && eraseEnd) {
@@ -450,25 +490,30 @@ bgInput.addEventListener('change', (e) => {
     // Reset save counter
     saveCounter = 0;
     drawScene();
-    // If overlay exists but is larger than new background, resize overlay
-    if (overlayImg) {
-      // Fit overlay within background bounds
-      const maxW = bgImg.width;
-      const maxH = bgImg.height;
-      const ovW = overlayImg.width;
-      const ovH = overlayImg.height;
-      const scaleX = maxW / ovW;
-      const scaleY = maxH / ovH;
-      const maxScale = Math.min(scaleX, scaleY, 1);
-      overlayState.scale = maxScale;
-      // Clamp overlay position
-      overlayState.x = Math.min(overlayState.x, bgImg.width - ovW * overlayState.scale);
-      overlayState.y = Math.min(overlayState.y, bgImg.height - ovH * overlayState.scale);
+    // If overlays exist, ensure each overlay fits within new background bounds
+    if (overlays.length > 0) {
+      overlays.forEach((ov) => {
+        const maxW = bgImg.width;
+        const maxH = bgImg.height;
+        const ovW = ov.img ? ov.img.width : 0;
+        const ovH = ov.img ? ov.img.height : 0;
+        if (ovW === 0 || ovH === 0) return;
+        const scaleX = maxW / ovW;
+        const scaleY = maxH / ovH;
+        const maxScale = Math.min(scaleX, scaleY, 1);
+        // Keep the current scale if it's smaller; otherwise reduce to maxScale
+        ov.state.scale = Math.min(ov.state.scale, maxScale);
+        // Clamp position inside the new background
+        const wScaled = ovW * Math.abs(ov.state.scale);
+        const hScaled = ovH * Math.abs(ov.state.scale);
+        ov.state.x = Math.max(0, Math.min(ov.state.x, bgImg.width - wScaled));
+        ov.state.y = Math.max(0, Math.min(ov.state.y, bgImg.height - hScaled));
+      });
     }
-    controls.style.display = 'flex';
-    saveBtn.disabled = !overlayImg;
+    // Show controls if there is at least one overlay; allow setting output directory and erasing
+    controls.style.display = overlays.length > 0 ? 'flex' : 'none';
+    saveBtn.disabled = overlays.length === 0;
     setOutputBtn.disabled = false;
-    // Enable erase functionality now that a background is loaded
     eraseBtn.disabled = false;
   };
   img.src = URL.createObjectURL(file);
@@ -477,66 +522,86 @@ bgInput.addEventListener('change', (e) => {
 // Event: load overlay
 overlayInput.addEventListener('change', (e) => {
   const file = e.target.files[0];
+  // Only allow adding an overlay if a background exists
   if (!file || !bgImg) return;
   const rawImg = new Image();
   rawImg.onload = () => {
     // Apply grey key to convert to RGBA with transparency
     applyGreyKey(rawImg, (rgbaImg) => {
-      overlayImg = rgbaImg;
-      overlayOriginalImg = rgbaImg; // Save untransformed for overlay-only output
-      // Compute initial scale: fit overlay into background if larger
+      // Compute initial scale to fit the overlay within the background
       const maxW = bgImg.width;
       const maxH = bgImg.height;
-      const ovW = overlayImg.width;
-      const ovH = overlayImg.height;
+      const ovW = rgbaImg.width;
+      const ovH = rgbaImg.height;
       const scaleX = maxW / ovW;
       const scaleY = maxH / ovH;
       const maxScale = Math.min(scaleX, scaleY, 1);
-      overlayState.scale = maxScale;
-      overlayState.angle = 0;
-      overlayState.flipH = false;
-      overlayState.flipV = false;
-      // Place overlay near top-left with small margin
-      overlayState.x = Math.min(20, maxW - ovW * overlayState.scale);
-      overlayState.y = Math.min(20, maxH - ovH * overlayState.scale);
+      // Construct a new overlay object
+      const ov = {
+        img: rgbaImg,
+        originalImg: rgbaImg,
+        state: {
+          x: Math.min(20, maxW - ovW * maxScale),
+          y: Math.min(20, maxH - ovH * maxScale),
+          scale: maxScale,
+          angle: 0,
+          flipH: false,
+          flipV: false,
+        },
+        cropMode: false,
+        cropping: false,
+        cropStart: null,
+        cropEnd: null,
+      };
+      overlays.push(ov);
+      activeOverlayIndex = overlays.length - 1;
+      // Bring the newly added overlay to the top of the stacking order (already last)
+      updateActiveOverlayRefs();
+      // Enable controls now that at least one overlay exists
+      controls.style.display = 'flex';
       saveBtn.disabled = false;
       removeOverlayBtn.disabled = false;
       angleInput.value = 0;
-      // Enable crop functionality now that an overlay is loaded
+      // Enable crop functionality
       cropBtn.disabled = false;
-      // Reset cropping state and button label
-      cropMode = false;
-      cropping = false;
-      cropStart = null;
-      cropEnd = null;
       cropBtn.textContent = 'Crop';
-      drawScene();
       // Reset undo/redo stacks and save the initial state for undo
       undoStack.length = 0;
       redoStack.length = 0;
       saveState();
+      drawScene();
     });
   };
   rawImg.src = URL.createObjectURL(file);
+  // Reset input value to allow uploading the same file again
+  overlayInput.value = '';
 });
 
 // Remove overlay
 removeOverlayBtn.addEventListener('click', () => {
-  overlayImg = null;
-  overlayOriginalImg = null;
-  saveBtn.disabled = true;
-  removeOverlayBtn.disabled = true;
-  // Disable crop functionality when overlay is removed
-  cropBtn.disabled = true;
-  cropMode = false;
-  cropping = false;
-  cropStart = null;
-  cropEnd = null;
-  cropBtn.textContent = 'Crop';
+  // Remove the currently active overlay from the list
+  if (activeOverlayIndex < 0 || overlays.length === 0) return;
+  // Save current state for undo
+  saveState();
+  overlays.splice(activeOverlayIndex, 1);
+  // Adjust active overlay index
+  if (overlays.length === 0) {
+    activeOverlayIndex = -1;
+  } else {
+    // If we removed the last element, move active index to new last
+    if (activeOverlayIndex >= overlays.length) {
+      activeOverlayIndex = overlays.length - 1;
+    }
+  }
+  updateActiveOverlayRefs();
+  // Update UI: disable controls if no overlays remain
+  if (!overlayImg) {
+    saveBtn.disabled = true;
+    removeOverlayBtn.disabled = true;
+    cropBtn.disabled = true;
+    cropBtn.textContent = 'Crop';
+  }
   drawScene();
-  // Clear undo/redo stacks when overlay is removed
-  undoStack.length = 0;
-  redoStack.length = 0;
   updateUndoRedoButtons();
 });
 
@@ -556,6 +621,9 @@ setOutputBtn.addEventListener('click', async () => {
 // New session: clear everything
 newBtn.addEventListener('click', () => {
   bgImg = null;
+  // Clear overlays and reset active overlay
+  overlays = [];
+  activeOverlayIndex = -1;
   overlayImg = null;
   overlayOriginalImg = null;
   overlayState = { x: 0, y: 0, scale: 1, angle: 0, flipH: false, flipV: false };
@@ -569,12 +637,8 @@ newBtn.addEventListener('click', () => {
   setOutputBtn.disabled = true;
   outputDirHandle = null;
   outputStatus.textContent = '';
-  // Reset crop state and disable crop button
+  // Disable crop functionality for new session
   cropBtn.disabled = true;
-  cropMode = false;
-  cropping = false;
-  cropStart = null;
-  cropEnd = null;
   cropBtn.textContent = 'Crop';
   // Reset erase state and disable erase button
   eraseBtn.disabled = true;
@@ -696,43 +760,86 @@ canvas.addEventListener('pointerdown', (e) => {
     e.preventDefault();
     return;
   }
-  // If no overlay is loaded, nothing else to do
-  if (!overlayImg) return;
-  // Compute overlay dimensions in scaled units
+  // Determine which overlay (if any) is under the pointer. Iterate from topmost to bottom.
+  let foundIndex = -1;
+  for (let i = overlays.length - 1; i >= 0; i--) {
+    const ov = overlays[i];
+    const wOv = ov.img.width * Math.abs(ov.state.scale);
+    const hOv = ov.img.height * Math.abs(ov.state.scale);
+    const cxOv = ov.state.x + wOv / 2;
+    const cyOv = ov.state.y + hOv / 2;
+    // Translate pointer into this overlay's local space
+    const dxOv = x - cxOv;
+    const dyOv = y - cyOv;
+    const angleRadOv = (-ov.state.angle * Math.PI) / 180;
+    const localXOv = dxOv * Math.cos(angleRadOv) - dyOv * Math.sin(angleRadOv);
+    const localYOv = dxOv * Math.sin(angleRadOv) + dyOv * Math.cos(angleRadOv);
+    if (Math.abs(localXOv) <= wOv / 2 && Math.abs(localYOv) <= hOv / 2) {
+      foundIndex = i;
+      break;
+    }
+  }
+  // If an overlay was clicked, make it active (move to top) and update references
+  if (foundIndex >= 0) {
+    // Bring the found overlay to the top of the stacking order if it's not already topmost
+    const ov = overlays[foundIndex];
+    overlays.splice(foundIndex, 1);
+    overlays.push(ov);
+    activeOverlayIndex = overlays.length - 1;
+    updateActiveOverlayRefs();
+    // Cancel crop mode of all other overlays
+    overlays.forEach((o, idx) => {
+      if (idx !== activeOverlayIndex && o.cropMode) {
+        o.cropMode = false;
+        o.cropping = false;
+        o.cropStart = null;
+        o.cropEnd = null;
+      }
+    });
+  }
+  // If no overlay is active after selection, exit
+  if (!overlayImg || activeOverlayIndex < 0) {
+    return;
+  }
+  // Compute overlay dimensions and local coordinates for the active overlay
   const w = overlayImg.width * Math.abs(overlayState.scale);
   const h = overlayImg.height * Math.abs(overlayState.scale);
   const cx = overlayState.x + w / 2;
   const cy = overlayState.y + h / 2;
-  // Translate pointer into overlay local space (scaled)
   const dx = x - cx;
   const dy = y - cy;
   const angleRad = (-overlayState.angle * Math.PI) / 180;
   const localX = dx * Math.cos(angleRad) - dy * Math.sin(angleRad);
   const localY = dx * Math.sin(angleRad) + dy * Math.cos(angleRad);
-  // If crop mode is active, begin cropping when clicking inside overlay
-  if (cropMode) {
+  // Reference to current active overlay
+  const activeOverlay = overlays[activeOverlayIndex];
+  // If crop mode is active for the current overlay, begin cropping when clicking inside it
+  if (activeOverlay.cropMode) {
     const unscaledX = localX / overlayState.scale;
     const unscaledY = localY / overlayState.scale;
-    if (Math.abs(unscaledX) <= overlayOriginalImg.width / 2 && Math.abs(unscaledY) <= overlayOriginalImg.height / 2) {
-      cropping = true;
-      cropStart = { x: unscaledX, y: unscaledY };
-      cropEnd = { x: unscaledX, y: unscaledY };
+    if (
+      Math.abs(unscaledX) <= overlayOriginalImg.width / 2 &&
+      Math.abs(unscaledY) <= overlayOriginalImg.height / 2
+    ) {
+      activeOverlay.cropping = true;
+      activeOverlay.cropStart = { x: unscaledX, y: unscaledY };
+      activeOverlay.cropEnd = { x: unscaledX, y: unscaledY };
       canvas.setPointerCapture(e.pointerId);
       drawScene();
       e.preventDefault();
       return;
     } else {
       // Clicked outside overlay: cancel crop mode
-      cropMode = false;
-      cropping = false;
-      cropStart = null;
-      cropEnd = null;
+      activeOverlay.cropMode = false;
+      activeOverlay.cropping = false;
+      activeOverlay.cropStart = null;
+      activeOverlay.cropEnd = null;
       cropBtn.textContent = 'Crop';
       drawScene();
       return;
     }
   }
-  // Check for resize handle interactions
+  // Check for resize handle interactions on the active overlay
   if (overlayImg) {
     const handleSize = 10;
     const corners = [
@@ -773,14 +880,15 @@ canvas.addEventListener('pointermove', (e) => {
     drawScene();
     return;
   }
-  if (!overlayImg) return;
+  if (!overlayImg || activeOverlayIndex < 0) return;
   const w = overlayImg.width * Math.abs(overlayState.scale);
   const h = overlayImg.height * Math.abs(overlayState.scale);
   const cx = overlayState.x + w / 2;
   const cy = overlayState.y + h / 2;
   const angleRad = (overlayState.angle * Math.PI) / 180;
-  // If cropping, update the end point and redraw
-  if (cropping) {
+  const activeOverlay = overlays[activeOverlayIndex];
+  // If the active overlay is currently being cropped, update its crop end point
+  if (activeOverlay && activeOverlay.cropping) {
     const rectMov = canvas.getBoundingClientRect();
     const px = ((e.clientX - rectMov.left) / rectMov.width) * canvas.width;
     const py = ((e.clientY - rectMov.top) / rectMov.height) * canvas.height;
@@ -791,27 +899,21 @@ canvas.addEventListener('pointermove', (e) => {
     const localYS = dxp * Math.sin(angleR) + dyp * Math.cos(angleR);
     const unscaledX = localXS / overlayState.scale;
     const unscaledY = localYS / overlayState.scale;
-    cropEnd = { x: unscaledX, y: unscaledY };
+    activeOverlay.cropEnd = { x: unscaledX, y: unscaledY };
     drawScene();
     return;
   }
-  // If resizing, adjust scale based on handle movement
+  // If resizing the active overlay, adjust its scale based on handle movement
   if (resizing) {
-    // Transform pointer into overlay local space (accounting for rotation)
     const dxPointer = x - cx;
     const dyPointer = y - cy;
     const localX = dxPointer * Math.cos(-angleRad) - dyPointer * Math.sin(-angleRad);
     const localY = dxPointer * Math.sin(-angleRad) + dyPointer * Math.cos(-angleRad);
-    // Determine new half‑width and half‑height based on pointer
-    // We use absolute values since scale applies symmetrically about centre
     const halfW = Math.abs(localX);
     const halfH = Math.abs(localY);
-    // Compute provisional scale factors along each axis
     const scaleX = (2 * halfW) / overlayImg.width;
     const scaleY = (2 * halfH) / overlayImg.height;
-    // Maintain aspect ratio by choosing the smaller scale (so the overlay fits within the dragged rectangle)
     let newScale = Math.min(scaleX, scaleY);
-    // Clamp newScale to a reasonable range
     const maxScale = Math.min(bgImg.width / overlayImg.width, bgImg.height / overlayImg.height);
     newScale = Math.min(newScale, maxScale);
     const minScale = 0.05;
@@ -832,7 +934,6 @@ canvas.addEventListener('pointermove', (e) => {
   }
   // Handle dragging overlay
   if (dragging) {
-    // Inverse transform local coords to compute new centre
     const dx = dragData.localX;
     const dy = dragData.localY;
     const globalLocalX = dx * Math.cos(angleRad) - dy * Math.sin(angleRad);
@@ -841,7 +942,6 @@ canvas.addEventListener('pointermove', (e) => {
     const newCy = y - globalLocalY;
     let newX = newCx - w / 2;
     let newY = newCy - h / 2;
-    // Clamp within background bounds
     newX = Math.max(0, Math.min(newX, bgImg.width - w));
     newY = Math.max(0, Math.min(newY, bgImg.height - h));
     overlayState.x = newX;
@@ -861,14 +961,17 @@ canvas.addEventListener('pointerup', (e) => {
     performErase();
     return;
   }
-  // If cropping, finalize the crop
-  if (cropping) {
-    cropping = false;
-    cropMode = false;
-    cropBtn.textContent = 'Crop';
-    canvas.releasePointerCapture(e.pointerId);
-    performCrop();
-    return;
+  // If cropping an overlay, finalize the crop
+  if (activeOverlayIndex >= 0) {
+    const ov = overlays[activeOverlayIndex];
+    if (ov.cropping) {
+      ov.cropping = false;
+      ov.cropMode = false;
+      cropBtn.textContent = 'Crop';
+      canvas.releasePointerCapture(e.pointerId);
+      performCrop();
+      return;
+    }
   }
   if (dragging) {
     dragging = false;
@@ -885,11 +988,11 @@ canvas.addEventListener('pointerup', (e) => {
 
 // Save outputs (async to allow writing files via File System Access API)
 saveBtn.addEventListener('click', async () => {
-  if (!bgImg || !overlayImg) return;
+  // Only save if a background is loaded and there is at least one overlay
+  if (!bgImg || overlays.length === 0) return;
   // Determine base name for output
   let prefix = outputPrefixInput.value.trim();
   if (!prefix) {
-    // default: use background file name if available
     const bgFile = bgInput.files[0];
     if (bgFile) {
       const name = bgFile.name;
@@ -898,62 +1001,74 @@ saveBtn.addEventListener('click', async () => {
       prefix = 'output';
     }
   }
-  // Compose composite canvas
+  // Compose composite canvas: draw background then all overlays in stacking order
   const canvasComposite = document.createElement('canvas');
   canvasComposite.width = bgImg.width;
   canvasComposite.height = bgImg.height;
   const ctxC = canvasComposite.getContext('2d');
   ctxC.drawImage(bgImg, 0, 0);
-  const w = overlayImg.width * overlayState.scale;
-  const h = overlayImg.height * overlayState.scale;
-  const cx = overlayState.x + w / 2;
-  const cy = overlayState.y + h / 2;
-  ctxC.save();
-  ctxC.translate(cx, cy);
-  ctxC.rotate((overlayState.angle * Math.PI) / 180);
-  const sx = overlayState.flipH ? -1 : 1;
-  const sy = overlayState.flipV ? -1 : 1;
-  ctxC.scale(sx, sy);
-  ctxC.scale(overlayState.scale, overlayState.scale);
-  ctxC.drawImage(
-    overlayImg,
-    -overlayImg.width / 2,
-    -overlayImg.height / 2
-  );
-  ctxC.restore();
+  // Draw overlays from first to last (bottom to top)
+  overlays.forEach((ov) => {
+    if (!ov.img) return;
+    const wOv = ov.img.width * Math.abs(ov.state.scale);
+    const hOv = ov.img.height * Math.abs(ov.state.scale);
+    const cxOv = ov.state.x + wOv / 2;
+    const cyOv = ov.state.y + hOv / 2;
+    ctxC.save();
+    ctxC.translate(cxOv, cyOv);
+    ctxC.rotate((ov.state.angle * Math.PI) / 180);
+    const sxOv = ov.state.flipH ? -1 : 1;
+    const syOv = ov.state.flipV ? -1 : 1;
+    ctxC.scale(sxOv, syOv);
+    ctxC.scale(ov.state.scale, ov.state.scale);
+    ctxC.drawImage(ov.img, -ov.img.width / 2, -ov.img.height / 2);
+    ctxC.restore();
+  });
   const compositeDataUrl = canvasComposite.toDataURL('image/png');
-  // Create overlay-only canvas (original keyed)
-  const canvasObj = document.createElement('canvas');
-  canvasObj.width = overlayOriginalImg.width;
-  canvasObj.height = overlayOriginalImg.height;
-  const ctxO = canvasObj.getContext('2d');
-  ctxO.drawImage(overlayOriginalImg, 0, 0);
-  const objectDataUrl = canvasObj.toDataURL('image/png');
-  // Determine unique base name
-  const baseName = saveCounter === 0 ? prefix : `${prefix}_${saveCounter}`;
+  // Generate overlay-only images and names for each overlay
+  const objectDataUrls = [];
+  const objectNames = [];
+  overlays.forEach((ov, idx) => {
+    if (!ov.originalImg) return;
+    const canvasObj = document.createElement('canvas');
+    canvasObj.width = ov.originalImg.width;
+    canvasObj.height = ov.originalImg.height;
+    const ctxO = canvasObj.getContext('2d');
+    ctxO.drawImage(ov.originalImg, 0, 0);
+    const objUrl = canvasObj.toDataURL('image/png');
+    objectDataUrls.push(objUrl);
+    const baseName = saveCounter === 0 ? `${prefix}_ov${idx + 1}` : `${prefix}_${saveCounter}_ov${idx + 1}`;
+    objectNames.push(`${baseName}.png`);
+  });
+  // Determine composite name; increment saveCounter once for the entire save operation
+  const compositeBaseName = saveCounter === 0 ? prefix : `${prefix}_${saveCounter}`;
+  const canvasName = `${compositeBaseName}.png`;
   saveCounter++;
-  const canvasName = `${baseName}.png`;
-  const objectName = `${baseName}.png`;
-  // If outputDirHandle is selected, write to disk using File System Access API
+  // Save or download files
   if (outputDirHandle) {
     try {
-      // Create subdirectories if not existing
       const canvasDir = await outputDirHandle.getDirectoryHandle('Canvas', { create: true });
       const objectsDir = await outputDirHandle.getDirectoryHandle('objects', { create: true });
-      // Write composite
       await writeDataUrlToFile(canvasDir, canvasName, compositeDataUrl);
-      await writeDataUrlToFile(objectsDir, objectName, objectDataUrl);
-      alert(`Saved to ${canvasDir.name}/${canvasName} and ${objectsDir.name}/${objectName}`);
+      // Save each overlay object
+      for (let i = 0; i < objectDataUrls.length; i++) {
+        await writeDataUrlToFile(objectsDir, objectNames[i], objectDataUrls[i]);
+      }
+      alert(`Saved composite and ${objectDataUrls.length} overlay objects to selected folder.`);
     } catch (err) {
       console.error('Error writing files via File System Access API:', err);
       // Fallback to download
       downloadDataUrl(compositeDataUrl, `Canvas_${canvasName}`);
-      downloadDataUrl(objectDataUrl, `objects_${objectName}`);
+      for (let i = 0; i < objectDataUrls.length; i++) {
+        downloadDataUrl(objectDataUrls[i], `objects_${objectNames[i]}`);
+      }
     }
   } else {
-    // Download via anchor; embed folder names in file name to differentiate
+    // Fallback: download via anchor with folder prefixes in file names
     downloadDataUrl(compositeDataUrl, `Canvas_${canvasName}`);
-    downloadDataUrl(objectDataUrl, `objects_${objectName}`);
+    for (let i = 0; i < objectDataUrls.length; i++) {
+      downloadDataUrl(objectDataUrls[i], `objects_${objectNames[i]}`);
+    }
   }
 });
 
@@ -970,20 +1085,23 @@ async function writeDataUrlToFile(dirHandle, filename, dataUrl) {
 // Perform cropping operation on the overlay image using cropStart and cropEnd.
 // Cropping is defined in the overlay's local coordinate system (origin at centre, units in original pixels).
 function performCrop() {
+  // Only perform cropping if there is an active overlay
+  if (activeOverlayIndex < 0) return;
+  const ov = overlays[activeOverlayIndex];
   // Validate state
-  if (!cropStart || !cropEnd || !overlayOriginalImg) return;
-  const oldWidth = overlayOriginalImg.width;
-  const oldHeight = overlayOriginalImg.height;
+  if (!ov.cropStart || !ov.cropEnd || !ov.originalImg) return;
+  const oldWidth = ov.originalImg.width;
+  const oldHeight = ov.originalImg.height;
   // Determine the rectangle boundaries in local unscaled coordinates
-  let x1 = Math.min(cropStart.x, cropEnd.x);
-  let x2 = Math.max(cropStart.x, cropEnd.x);
-  let y1 = Math.min(cropStart.y, cropEnd.y);
-  let y2 = Math.max(cropStart.y, cropEnd.y);
+  let x1 = Math.min(ov.cropStart.x, ov.cropEnd.x);
+  let x2 = Math.max(ov.cropStart.x, ov.cropEnd.x);
+  let y1 = Math.min(ov.cropStart.y, ov.cropEnd.y);
+  let y2 = Math.max(ov.cropStart.y, ov.cropEnd.y);
   // Adjust bounds for flips: unflip the selection back to original orientation
-  const x1f = overlayState.flipH ? -x2 : x1;
-  const x2f = overlayState.flipH ? -x1 : x2;
-  const y1f = overlayState.flipV ? -y2 : y1;
-  const y2f = overlayState.flipV ? -y1 : y2;
+  const x1f = ov.state.flipH ? -x2 : x1;
+  const x2f = ov.state.flipH ? -x1 : x2;
+  const y1f = ov.state.flipV ? -y2 : y1;
+  const y2f = ov.state.flipV ? -y1 : y2;
   // Convert to pixel coordinates in the original overlay image
   let u1 = Math.max(0, Math.floor(x1f + oldWidth / 2));
   let u2 = Math.min(oldWidth, Math.ceil(x2f + oldWidth / 2));
@@ -993,8 +1111,8 @@ function performCrop() {
   const hCrop = v2 - v1;
   if (wCrop <= 0 || hCrop <= 0) {
     // Nothing to crop
-    cropStart = null;
-    cropEnd = null;
+    ov.cropStart = null;
+    ov.cropEnd = null;
     return;
   }
   // Centre of the crop in unscaled local coordinates
@@ -1005,23 +1123,23 @@ function performCrop() {
   tmpCanvas.width = wCrop;
   tmpCanvas.height = hCrop;
   const tmpCtx = tmpCanvas.getContext('2d');
-  tmpCtx.drawImage(overlayOriginalImg, -u1, -v1);
+  tmpCtx.drawImage(ov.originalImg, -u1, -v1);
   const dataURL = tmpCanvas.toDataURL();
   const newImg = new Image();
   newImg.onload = () => {
     // Update overlay images
-    overlayImg = newImg;
-    overlayOriginalImg = newImg;
+    ov.img = newImg;
+    ov.originalImg = newImg;
     // Compute global shift: how far the crop centre is from the overlay centre
-    const scale = overlayState.scale;
-    const angleRad = (overlayState.angle * Math.PI) / 180;
+    const scale = ov.state.scale;
+    const angleRad = (ov.state.angle * Math.PI) / 180;
     const deltaX = cropCenterX * scale;
     const deltaY = cropCenterY * scale;
     const shiftX = deltaX * Math.cos(angleRad) - deltaY * Math.sin(angleRad);
     const shiftY = deltaX * Math.sin(angleRad) + deltaY * Math.cos(angleRad);
     // Compute old global centre
-    const oldCentreX = overlayState.x + (oldWidth * scale) / 2;
-    const oldCentreY = overlayState.y + (oldHeight * scale) / 2;
+    const oldCentreX = ov.state.x + (oldWidth * scale) / 2;
+    const oldCentreY = ov.state.y + (oldHeight * scale) / 2;
     // Compute new overlay dimensions (scaled)
     const newWidthScaled = wCrop * scale;
     const newHeightScaled = hCrop * scale;
@@ -1034,11 +1152,15 @@ function performCrop() {
     // Clamp within background bounds
     newX = Math.max(0, Math.min(newX, bgImg.width - newWidthScaled));
     newY = Math.max(0, Math.min(newY, bgImg.height - newHeightScaled));
-    overlayState.x = newX;
-    overlayState.y = newY;
+    ov.state.x = newX;
+    ov.state.y = newY;
     // Reset crop state
-    cropStart = null;
-    cropEnd = null;
+    ov.cropStart = null;
+    ov.cropEnd = null;
+    ov.cropMode = false;
+    ov.cropping = false;
+    cropBtn.textContent = 'Crop';
+    updateActiveOverlayRefs();
     drawScene();
     // Update undo/redo button states after cropping
     updateUndoRedoButtons();
