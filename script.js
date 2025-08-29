@@ -491,46 +491,10 @@ function drawScene() {
 
 // Helper: apply grey key to an Image to produce an RGBA image
 function applyGreyKey(img, callback) {
-  // Create a temporary canvas to read pixel data
-  const tmpCanvas = document.createElement('canvas');
-  tmpCanvas.width = img.width;
-  tmpCanvas.height = img.height;
-  const tmpCtx = tmpCanvas.getContext('2d');
-  tmpCtx.drawImage(img, 0, 0);
-  const imageData = tmpCtx.getImageData(0, 0, tmpCanvas.width, tmpCanvas.height);
-  const data = imageData.data;
-  const keyR = 128;
-  const keyG = 128;
-  const keyB = 128;
-  const tol = 22;
-  const ramp = tol < 254 ? 2 : 1;
-  // Precompute ramp lookup table for performance
-  const lut = new Uint8ClampedArray(256);
-  for (let d = 0; d < 256; d++) {
-    let a;
-    if (d <= tol) {
-      a = 0;
-    } else if (d >= tol + ramp) {
-      a = 255;
-    } else {
-      a = Math.round((255 * (d - tol)) / ramp);
-    }
-    lut[d] = a;
-  }
-  for (let i = 0; i < data.length; i += 4) {
-    const r = data[i];
-    const g = data[i + 1];
-    const b = data[i + 2];
-    const dr = Math.abs(r - keyR);
-    const dg = Math.abs(g - keyG);
-    const db = Math.abs(b - keyB);
-    const maxDiff = Math.max(dr, Math.max(dg, db));
-    data[i + 3] = lut[maxDiff];
-  }
-  tmpCtx.putImageData(imageData, 0, 0);
-  const rgbaImg = new Image();
-  rgbaImg.onload = () => callback(rgbaImg);
-  rgbaImg.src = tmpCanvas.toDataURL();
+  // Skip grey-key processing and return the original image unchanged.
+  // Some overlay images may contain grey colours that should not be treated
+  // as transparent. Pass through the image directly to preserve all pixels.
+  callback(img);
 }
 
 // Event: load background
