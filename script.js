@@ -127,13 +127,24 @@ const cropBtn = document.getElementById('crop');
 
 // Erase button and erasing state variables
 const eraseBtn = document.getElementById('erase');
-// Toggle for erase mode
+// Select element for choosing erase method (rectangle or brush)
+const eraseMethodSelect = document.getElementById('erase-method');
+// Range slider for brush size
+const brushSizeSlider = document.getElementById('brush-size');
+const brushSizeLabel = document.getElementById('brush-size-label');
+// Current erase method: 'rect' or 'brush'
+let eraseMethod = 'rect';
+// Toggle for erase mode (true when the user has clicked the Erase button and is selecting an area)
 let eraseMode = false;
-// True while the user is selecting an erase region on the background
+// True while the user is selecting an erase region on the background (rectangle) or drawing a brush path
 let erasing = false;
-// Start and end points of the erase rectangle in canvas coordinates
+// Start and end points of the erase rectangle in canvas coordinates (used only for rectangle mode)
 let eraseStart = null;
 let eraseEnd = null;
+// Brush path: array of {x,y} points collected when drawing with brush
+let brushPath = [];
+// Current brush radius in pixels (controlled via slider)
+let brushRadius = parseInt(brushSizeSlider ? brushSizeSlider.value : 20, 10) || 20;
 
 // Undo/Redo state and buttons. We maintain a stack of previous states
 // (undoStack) and a stack of undone states (redoStack). Each state stores
@@ -144,6 +155,28 @@ const undoBtn = document.getElementById('undo');
 const redoBtn = document.getElementById('redo');
 const undoStack = [];
 const redoStack = [];
+
+// Initialise erase method and brush UI behaviour
+if (eraseMethodSelect) {
+  // Update eraseMethod based on dropdown selection
+  eraseMethodSelect.addEventListener('change', (e) => {
+    eraseMethod = e.target.value || 'rect';
+    // Show or hide the brush size slider depending on the method
+    if (eraseMethod === 'brush' && brushSizeLabel) {
+      brushSizeLabel.style.display = '';
+    } else if (brushSizeLabel) {
+      brushSizeLabel.style.display = 'none';
+    }
+  });
+}
+if (brushSizeSlider) {
+  brushSizeSlider.addEventListener('input', (e) => {
+    const val = parseInt(e.target.value, 10);
+    if (!isNaN(val)) {
+      brushRadius = val;
+    }
+  });
+}
 
 // Save the current overlay state onto the undo stack and clear the redo
 // stack. Only saves when an overlay exists. Called at the beginning of
@@ -313,8 +346,10 @@ eraseBtn.addEventListener('click', () => {
     saveState();
     eraseMode = true;
     erasing = false;
+    // Reset selection states for both rectangle and brush methods
     eraseStart = null;
     eraseEnd = null;
+    brushPath = [];
     eraseBtn.textContent = 'Cancel Erase';
   } else {
     // Cancel erase mode without applying erase
@@ -322,6 +357,7 @@ eraseBtn.addEventListener('click', () => {
     erasing = false;
     eraseStart = null;
     eraseEnd = null;
+    brushPath = [];
     eraseBtn.textContent = 'Erase';
     drawScene();
   }
@@ -417,22 +453,39 @@ function drawScene() {
       }
     });
   }
-  // Draw the erase selection rectangle on the background when erasing
-  if ((eraseMode || erasing) && eraseStart && eraseEnd) {
-    const x1 = Math.min(eraseStart.x, eraseEnd.x);
-    const y1 = Math.min(eraseStart.y, eraseEnd.y);
-    const x2 = Math.max(eraseStart.x, eraseEnd.x);
-    const y2 = Math.max(eraseStart.y, eraseEnd.y);
-    ctx.save();
-    // Semi-transparent fill to indicate selected region
-    ctx.fillStyle = 'rgba(0, 0, 0, 0.25)';
-    ctx.fillRect(x1, y1, x2 - x1, y2 - y1);
-    ctx.strokeStyle = 'rgba(0, 0, 255, 0.8)';
-    ctx.lineWidth = 1;
-    ctx.setLineDash([6, 4]);
-    ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
-    ctx.setLineDash([]);
-    ctx.restore();
+  // Draw the erase selection overlay when erasing
+  if (eraseMode || erasing) {
+    // Brush preview: draw circles along the brush path if using brush method
+    if (eraseMethod === 'brush' && brushPath && brushPath.length > 0) {
+      ctx.save();
+      ctx.fillStyle = 'rgba(0, 0, 0, 0.25)';
+      ctx.strokeStyle = 'rgba(0, 0, 255, 0.8)';
+      ctx.lineWidth = 1;
+      brushPath.forEach((pt) => {
+        ctx.beginPath();
+        ctx.arc(pt.x, pt.y, brushRadius, 0, 2 * Math.PI);
+        ctx.fill();
+        ctx.stroke();
+      });
+      ctx.restore();
+    }
+    // Rectangle preview: draw selection rectangle if using rectangle method
+    if (eraseMethod === 'rect' && eraseStart && eraseEnd) {
+      const x1 = Math.min(eraseStart.x, eraseEnd.x);
+      const y1 = Math.min(eraseStart.y, eraseEnd.y);
+      const x2 = Math.max(eraseStart.x, eraseEnd.x);
+      const y2 = Math.max(eraseStart.y, eraseEnd.y);
+      ctx.save();
+      // Semi-transparent fill to indicate selected region
+      ctx.fillStyle = 'rgba(0, 0, 0, 0.25)';
+      ctx.fillRect(x1, y1, x2 - x1, y2 - y1);
+      ctx.strokeStyle = 'rgba(0, 0, 255, 0.8)';
+      ctx.lineWidth = 1;
+      ctx.setLineDash([6, 4]);
+      ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+      ctx.setLineDash([]);
+      ctx.restore();
+    }
   }
 }
 
@@ -657,6 +710,7 @@ newBtn.addEventListener('click', () => {
   erasing = false;
   eraseStart = null;
   eraseEnd = null;
+  brushPath = [];
   eraseBtn.textContent = 'Erase';
   // Clear undo/redo stacks on new session
   undoStack.length = 0;
@@ -763,13 +817,27 @@ canvas.addEventListener('pointerdown', (e) => {
   const y = ((e.clientY - rect.top) / rect.height) * canvas.height;
   // If erase mode is active, begin selecting erase region
   if (eraseMode) {
-    erasing = true;
-    eraseStart = { x, y };
-    eraseEnd = { x, y };
-    canvas.setPointerCapture(e.pointerId);
-    drawScene();
-    e.preventDefault();
-    return;
+    // Rectangle selection mode
+    if (eraseMethod === 'rect') {
+      erasing = true;
+      eraseStart = { x, y };
+      eraseEnd = { x, y };
+      canvas.setPointerCapture(e.pointerId);
+      drawScene();
+      e.preventDefault();
+      return;
+    }
+    // Brush selection mode
+    if (eraseMethod === 'brush') {
+      erasing = true;
+      brushPath = [];
+      brushPath.push({ x, y });
+      canvas.setPointerCapture(e.pointerId);
+      // Draw initial brush point overlay
+      drawScene();
+      e.preventDefault();
+      return;
+    }
   }
   // Determine which overlay (if any) is under the pointer. Iterate from topmost to bottom.
   let foundIndex = -1;
@@ -887,9 +955,19 @@ canvas.addEventListener('pointermove', (e) => {
   const y = ((e.clientY - rect.top) / rect.height) * canvas.height;
   // If the user is selecting an erase region
   if (erasing) {
-    eraseEnd = { x, y };
-    drawScene();
-    return;
+    // Handle rectangle erase selection
+    if (eraseMode && eraseMethod === 'rect') {
+      eraseEnd = { x, y };
+      drawScene();
+      return;
+    }
+    // Handle brush erase selection
+    if (eraseMode && eraseMethod === 'brush') {
+      // Append current point to the brush path
+      brushPath.push({ x, y });
+      drawScene();
+      return;
+    }
   }
   if (!overlayImg || activeOverlayIndex < 0) return;
   const w = overlayImg.width * Math.abs(overlayState.scale);
@@ -969,7 +1047,12 @@ canvas.addEventListener('pointerup', (e) => {
     eraseMode = false;
     eraseBtn.textContent = 'Erase';
     canvas.releasePointerCapture(e.pointerId);
-    performErase();
+    // Call appropriate erase function based on method
+    if (eraseMethod === 'rect') {
+      performErase();
+    } else if (eraseMethod === 'brush') {
+      performEraseBrush();
+    }
     return;
   }
   // If cropping an overlay, finalize the crop
@@ -1276,6 +1359,100 @@ async function performErase() {
     // Reset selection on error
     eraseStart = null;
     eraseEnd = null;
+    drawScene();
+    eraseBtn.disabled = false;
+    eraseBtn.textContent = 'Erase';
+  }
+}
+
+/**
+ * Perform a generative erase using a freeform brush path. The brushPath array
+ * contains canvas coordinates representing the centre points of a circular
+ * brush. A mask is constructed by drawing filled circles of the current
+ * brush radius at each recorded point. The Bria erase API is called with
+ * the background image and the generated mask. On success, the background
+ * image is updated and the brushPath is cleared.
+ */
+async function performEraseBrush() {
+  if (!bgImg || !brushPath || brushPath.length === 0) {
+    brushPath = [];
+    drawScene();
+    return;
+  }
+  try {
+    eraseBtn.disabled = true;
+    eraseBtn.textContent = 'Erasing...';
+    // Create an off‑screen canvas for the background image only
+    const imgCanvas = document.createElement('canvas');
+    imgCanvas.width = bgImg.width;
+    imgCanvas.height = bgImg.height;
+    const imgCtx = imgCanvas.getContext('2d');
+    imgCtx.drawImage(bgImg, 0, 0);
+    // Create a mask canvas: black background
+    const maskCanvas = document.createElement('canvas');
+    maskCanvas.width = bgImg.width;
+    maskCanvas.height = bgImg.height;
+    const maskCtx = maskCanvas.getContext('2d');
+    maskCtx.fillStyle = 'black';
+    maskCtx.fillRect(0, 0, maskCanvas.width, maskCanvas.height);
+    // Draw white circles along the brush path
+    maskCtx.fillStyle = 'white';
+    brushPath.forEach((pt) => {
+      maskCtx.beginPath();
+      maskCtx.arc(pt.x, pt.y, brushRadius, 0, 2 * Math.PI);
+      maskCtx.fill();
+    });
+    // Convert canvases to base64 strings
+    const imgDataUrl = imgCanvas.toDataURL('image/png');
+    const maskDataUrl = maskCanvas.toDataURL('image/png');
+    const imgBase64 = imgDataUrl.split(',')[1];
+    const maskBase64 = maskDataUrl.split(',')[1];
+    // Prepare request payload
+    const payload = {
+      image: imgBase64,
+      mask: maskBase64,
+      sync: true,
+    };
+    const response = await fetch('https://engine.prod.bria-api.com/v2/image/edit/erase', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'api_token': 'a9aac20fdf824e8ab8d70a815c570d54',
+      },
+      body: JSON.stringify(payload),
+    });
+    if (!response.ok) {
+      console.error('Brush erase API request failed:', response.status, response.statusText);
+      brushPath = [];
+      drawScene();
+      eraseBtn.disabled = false;
+      eraseBtn.textContent = 'Erase';
+      return;
+    }
+    const data = await response.json();
+    if (data.result && data.result.image_url) {
+      const newImageUrl = data.result.image_url;
+      const newImg = new Image();
+      newImg.crossOrigin = 'anonymous';
+      newImg.onload = () => {
+        bgImg = newImg;
+        brushPath = [];
+        eraseBtn.disabled = false;
+        eraseBtn.textContent = 'Erase';
+        drawScene();
+        updateUndoRedoButtons();
+      };
+      newImg.src = newImageUrl;
+    } else {
+      console.error('Brush erase API returned invalid response:', data);
+      brushPath = [];
+      drawScene();
+      eraseBtn.disabled = false;
+      eraseBtn.textContent = 'Erase';
+    }
+  } catch (err) {
+    console.error('Error performing brush erase:', err);
+    brushPath = [];
     drawScene();
     eraseBtn.disabled = false;
     eraseBtn.textContent = 'Erase';

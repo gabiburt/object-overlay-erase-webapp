@@ -130,6 +130,17 @@
       <button id="crop" disabled>Crop</button>
       <!-- Erase button: select a region on the background to erase via the Bria API -->
       <button id="erase" disabled>Erase</button>
+      <!-- Erase method selection: rectangle or brush -->
+      <label>Erase method:
+        <select id="erase-method">
+          <option value="rect">Rectangle</option>
+          <option value="brush">Brush</option>
+        </select>
+      </label>
+      <!-- Brush size slider; shown only when brush method is selected -->
+      <label id="brush-size-label" style="display:none;">Brush size:
+        <input type="range" id="brush-size" min="5" max="150" value="20" />
+      </label>
       <!-- Undo/Redo buttons for reverting actions -->
       <button id="undo" disabled>Undo</button>
       <button id="redo" disabled>Redo</button>
